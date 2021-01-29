@@ -11,12 +11,23 @@ import logging
 import numpy as np
 import random
 
+import logging
+import numpy as np
+import time
+import weakref
+from typing import Dict
+import torch
+from torch.nn.parallel import DataParallel, DistributedDataParallel
+
+import detectron2.utils.comm as comm
+from detectron2.utils.events import EventStorage, get_event_storage
+
 class LossEvalHook(HookBase):
     def __init__(self, eval_period, model, data_loader):
         self._model = model
         self._period = eval_period
         self._data_loader = data_loader
-    
+
     def _do_loss_eval(self):
         # Copying inference_on_dataset from evaluator.py
         total = len(self._data_loader)
@@ -53,18 +64,37 @@ class LossEvalHook(HookBase):
         comm.synchronize()
 
         return losses
-            
+   
+                
+    '''            
     def _get_loss(self, data):
-        # How loss is calculated on train_loop 
+        # How loss is calculated on train_loop
+        
         metrics_dict = self._model(data)
         metrics_dict = {
             k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else float(v)
             for k, v in metrics_dict.items()
         }
-        total_losses_reduced = sum(loss for loss in metrics_dict.values())
+        total_losses_reduced = sum(metrics_dict.values())#sum(loss for loss in metrics_dict.values())
+
         return total_losses_reduced
+    '''       
+    def _get_loss(self, data):
+        loss_dict = self._model(data)   
+        device = next(iter(loss_dict.values())).device
         
-        
+
+        # Use a new stream so these ops don't wait for DDP or backward
+        with torch.cuda.stream(torch.cuda.Stream() if device.type == "cuda" else None):
+            metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
+            
+
+            # Gather metrics among all workers for logging
+            # This assumes we do DDP-style training, which is currently the only
+            # supported method in detectron2.
+            all_metrics_dict = comm.gather(metrics_dict)
+        total_losses_reduced = sum(metrics_dict.values())
+        return total_losses_reduced   
     def after_step(self):
         next_iter = self.trainer.iter + 1
         is_final = next_iter == self.trainer.max_iter
